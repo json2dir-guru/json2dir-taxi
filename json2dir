@@ -1,0 +1,64 @@
+#!/bin/sh
+# The Taxi evaluator (json2dir.taxi, generated from gen/evaluator.py by the Taxi
+# stack-VM assembler and run by the reference Taxi interpreter) owns UTF-8 checking,
+# JSON parsing, validation, traversal and shell generation.  This launcher only
+# moves bytes and runs the generated script.
+#
+# Transport framing only: the Taxi "Post Office" reads a whole line of stdin and
+# cannot signal end of input, so the launcher feeds the document as one decimal
+# byte per line, then a 256 sentinel the evaluator treats as EOF.  No parsing,
+# validation or decisions happen here.
+set -eu
+
+if [ "$#" -ne 0 ]; then
+  printf '%s\n' 'Usage: json2dir < file.json' >&2
+  exit 2
+fi
+
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+
+task_tmp=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/json2dir.XXXXXXXXXX")
+trap 'rm -rf -- "$task_tmp"' 0
+trap 'exit 1' HUP INT TERM
+
+if ! (umask 077; cat > "$task_tmp/input.json"); then
+  printf '%s\n' "json2dir: couldn't read stdin" >&2
+  exit 1
+fi
+
+# Frame the raw bytes: one unsigned decimal per line, then the 256 EOF sentinel.
+if ! (
+  umask 077
+  {
+    od -v -An -tu1 < "$task_tmp/input.json" | tr -s ' ' '\n' | grep -v '^$'
+    printf '%s\n' 256
+  } > "$task_tmp/framed.txt"
+); then
+  printf '%s\n' 'json2dir: could not frame input' >&2
+  exit 1
+fi
+
+# The Taxi interpreter has no stderr contract we rely on: the evaluator prints its
+# shell script (or a "json2dir: ..." error line) to stdout and ends.  The script is
+# run only if the evaluator succeeded and wrote its end marker as the last line.
+if ! (
+  umask 077
+  "${JSON2DIR_TAXI:-taxi}" "$script_dir/json2dir.taxi" \
+    < "$task_tmp/framed.txt" > "$task_tmp/tree.sh" 2> "$task_tmp/taxi.err"
+); then
+  # interpreter failed (e.g. out of gas); surface whatever the evaluator printed
+  tail -n 1 "$task_tmp/tree.sh" >&2 2>/dev/null || true
+  printf '%s\n' 'json2dir: the evaluator did not finish' >&2
+  exit 1
+fi
+
+if [ "$(tail -n 1 "$task_tmp/tree.sh")" != '# json2dir: end' ]; then
+  last=$(tail -n 1 "$task_tmp/tree.sh")
+  case $last in
+    'json2dir: '*) printf '%s\n' "$last" >&2 ;;
+    *) printf '%s\n' 'json2dir: the evaluator did not finish' >&2 ;;
+  esac
+  exit 1
+fi
+
+"${JSON2DIR_SHELL:-/bin/sh}" "$task_tmp/tree.sh"
